@@ -1,8 +1,19 @@
 # Your Name and Drexel ID
-Samii Shabuse
-sus24@drexel.edu
+Name: Samii Shabuse
+Email: sus24@drexel.edu
 
 # Instructions
+
+## How to Run The Code
+```bash
+make
+./bin/island <adults> <children>
+
+# or you can also do
+
+make run # runs 7 adults, 9 children
+```
+
 
 # Short Essay Question 1: What did you use to protect the boat and why?
 
