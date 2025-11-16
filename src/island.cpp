@@ -1,3 +1,21 @@
+/**
+ * @file src/island.cpp
+ * 
+ * @brief Simulation of ferrying adults and children between an island and mainland using threads.
+ * 
+ * @author Samii Shabuse <sus24@drexel.edu>
+ * @date November 16, 2025
+ * 
+ * @section Overview
+ * 
+ * This program simulates the problem of ferrying adults and children between an island and mainland
+ * using a boat that can carry either one adult or up to two children at a time. The program uses threads
+ * to represent each person (adult or child) and employs synchronization mechanisms to ensure safe
+ * and orderly boat trips. The boat trips are orchestrated by a controller loop that follows a
+ * deterministic strategy to minimize the number of trips while adhering to the constraints of the boat's capacity
+ * and the maximum consecutive rowing limit for each person.
+ */
+
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -239,17 +257,37 @@ void Person::run() {
  */
 bool parse_args(int argc, char** argv, int &A, int &C) {
     if (argc != 3) {
-        std::cerr << "usage: ./bin/island_2 <adults> <children>" << std::endl;
+        std::cerr << "usage: ./bin/island <adults> <children>" << std::endl;
         return false;
     }
-    A = std::stoi(argv[1]);
-    C = std::stoi(argv[2]);
+
+    try {
+        A = std::stoi(argv[1]);
+        C = std::stoi(argv[2]);
+    } catch (...) {
+        std::cerr << "inputs must be integers" << std::endl;
+        return false;
+    }
+
     if (A <= 0 || C <= 0) {
         std::cerr << "inputs must be > 0" << std::endl;
         return false;
     }
+
+    if (C < 2) {
+        std::cerr << "Error: At least two children are required to operate the boat." << std::endl;
+        return false;
+    }
+
+    if (C < A + 1) {
+        std::cerr << "Error: Impossible to evacuate all adults with only "
+                  << C << " children and " << A << " adults." << std::endl;
+        return false;
+    }
+
     return true;
 }
+
 
 /**
  * @brief Initialize person objects and assign them to the boat.
@@ -329,8 +367,7 @@ Person* find_person(std::vector<std::unique_ptr<Person>> &people, bool wantAdult
  * 
  * @return void
  * 
- * @details Implements the deterministic two-child ferry algorithm used by
- *          the original solution: it repeatedly moves two children,
+ * @details Implementation: it repeatedly moves two children,
  *          returns one, ships an adult with a child driving, and returns a
  *          child, until all adults are moved; then it moves remaining
  *          children. The function holds the boat mutex while deciding and
@@ -361,16 +398,16 @@ void controller_loop(Boat &boat, std::vector<std::unique_ptr<Person>> &people) {
         boat.tripDoneCv.wait(lk);
 
         // 3) One adult + one child go island -> mainland (child drives)
-        Person* adult = find_person(people, true, ISLAND, /*excludeNeedsBreak=*/false);
-        Person* child = find_person(people, false, ISLAND, /*excludeNeedsBreak=*/false);
+        Person* adult = find_person(people, true, ISLAND, false);
+        Person* child = find_person(people, false, ISLAND, false);
         if (!adult || !child) break;
         boat.driver = child; boat.passenger = adult; child->role = Person::DRIVER; adult->role = Person::PASSENGER;
         child->seated = adult->seated = false; child->cv.notify_one(); adult->cv.notify_one();
         boat.tripDoneCv.wait(lk);
 
         // 4) One child returns mainland -> island
-        Person* rc2 = find_person(people, false, MAINLAND, /*excludeNeedsBreak=*/false);
-        if (!rc2) rc2 = find_person(people, true, MAINLAND, /*excludeNeedsBreak=*/false);
+        Person* rc2 = find_person(people, false, MAINLAND, false);
+        if (!rc2) rc2 = find_person(people, true, MAINLAND, false);
         if (!rc2) break;
         boat.driver = rc2; boat.passenger = nullptr; rc2->role = Person::DRIVER; rc2->seated = false; rc2->cv.notify_one();
         boat.tripDoneCv.wait(lk);

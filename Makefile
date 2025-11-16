@@ -1,7 +1,7 @@
 CXX=g++
 CXXFLAGS=-std=c++17 -O2 -pthread
 BIN=bin/island
-SRC=src/island.cpp src/semaphore.cpp
+SRC=src/island.cpp
 
 all: $(BIN)
 
