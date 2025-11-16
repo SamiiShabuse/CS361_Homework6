@@ -487,8 +487,8 @@ void print_summary(Boat &boat) {
     std::cout << "Boats with 2 children: " << boat.twokidBoats << std::endl;
     std::cout << "Boats with 1 child and 1 adult: " << boat.kidAdultBoats << std::endl;
     std::cout << "Boats with only 1 person (child or adult): " << boat.soloBoats << std::endl;
-    std::cout << "Times adults where the driver: " << boat.adultDrivers << std::endl;
-    std::cout << "Times children where the driver: " << boat.childDrivers << std::endl;
+    std::cout << "Times adults were the driver: " << boat.adultDrivers << std::endl;
+    std::cout << "Times children were the driver: " << boat.childDrivers << std::endl;
 }
 
 /**
