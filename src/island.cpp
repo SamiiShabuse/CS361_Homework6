@@ -3,396 +3,484 @@
 #include <vector>
 #include <random>
 #include <chrono>
-#include "semaphore.h"
-#include <iostream>
-#include <thread>
-#include <vector>
-#include <random>
-#include <chrono>
-#include "semaphore.h"
+#include <mutex>
+#include <condition_variable>
+#include <memory>
 
-struct Boat;
-struct Person;
-
-// Only two locations
+// Global boat state of either ISLAND or MAINLAND
 enum Loc { ISLAND, MAINLAND };
 
+// maximum consecutive times a person may drive the boat
+static const int MAX_CONSECUTIVE = 4; 
+
+// forward declaration of Boat structure
+struct Boat;
+
+/**
+ * @struct Person
+ * 
+ * @brief Represents a person (adult or child) trying to cross between island and mainland.
+ * 
+ * The struct contains the person's ID, type (adult/child), current position,
+ * consecutive rowing count, role in the boat (driver/passenger/none), and
+ * threading constructs for synchronization.
+ */
 struct Person {
-    int id;              // printed id (1..A for adults, 1..C for children)
+    int id;
     bool isAdult;
-    Boat* boat;
-    Loc position = ISLAND;   // where this person currently is
-    int consectiveRows = 0;  // how many times in a row they’ve driven
+    Loc position = ISLAND;
+    int consecutiveRows = 0; // how many times they've rowed in a row
+
+    // assignment state (protected by boat->mtx)
+    enum Role { NONE, DRIVER, PASSENGER } role = NONE;
+    bool seated = false;
+    bool needsBreak = false; // true when reached MAX_CONSECUTIVE and needs a break
+
+    std::condition_variable cv;
     std::thread th;
 
+    Boat* boat = nullptr;
+
     void run();
-    void adultLoop();
-    void childLoop();
 };
 
+/**
+ * @struct Boat
+ * 
+ * @brief Represents the state of the boat and manages synchronization between persons.
+ * 
+ * The struct contains mutexes and condition variables for thread synchronization,
+ * the current location of the boat, counts of adults and children on the island,
+ * pointers to the current driver and passenger, and various statistics.
+ */
 struct Boat {
-    // current occupants
-    Person* driver = nullptr;
-    Person* passenger = nullptr;
+    std::mutex mtx;
+    std::condition_variable tripDoneCv; // controller waits for trip completion
 
-    // counts on the island
-    int adultsOnIsland;
-    int childrenOnIsland;
     Loc location = ISLAND;
 
-    // semaphores
-    Semaphore mutex{1};         // protects all shared state
-    Semaphore seatSlots{2};     // capacity of 2 seats
-    Semaphore needDriver{0};    // driver exists
-    Semaphore readyToDepart{0}; // composition valid; boat may depart
-    Semaphore tripDone{0};      // each rider waits once per trip
+    int adultsOnIsland = 0;
+    int childrenOnIsland = 0;
 
-    // phase for shuttle policy
-    enum Phase { KIDKID_OUT, KID_BACK, ADULT_WITH_KID, KID_BACK2, KIDS_FINISH };
-    Phase phase = KIDKID_OUT;
+    Person* driver = nullptr;
+    Person* passenger = nullptr;
+    int boardedCount = 0;
 
-    // stats for summary
+    // stats
     int tripsToMain = 0, tripsToIsland = 0;
     int twokidBoats = 0, kidAdultBoats = 0, soloBoats = 0;
     int adultDrivers = 0, childDrivers = 0;
 
-    // RNG for 1–4 sec trip time
+    // RNG
     std::mt19937 rng{std::random_device{}()};
-    std::uniform_int_distribution<int> dist{1, 4};
+    // RNG for 1–4 second trip time said by the homework requirements
+    std::uniform_int_distribution<int> dist{1,4};
 
-    Boat(int A, int C) : adultsOnIsland(A), childrenOnIsland(C) {}
-
-    // ---- policy helpers (called with mutex held) ----
-    bool adultsRemain() const { return adultsOnIsland > 0; }
-    bool kidsRemain()   const { return childrenOnIsland > 0; }
-
-    bool canBoardAsPassenger(Person* p) {
-        // never allow 2 adults in the boat
-        if (driver && driver->isAdult && p->isAdult) return false;
-        return true;
-    }
-
-    bool compositionValid() {
-        // must have a driver
-        if (!driver) return false;
-        // solo driver trip is allowed
-        if (!passenger) return true;
-        // forbid 2 adults
-        if (driver->isAdult && passenger->isAdult) return false;
-        // 2 kids or kid+adult is fine
-        return true;
-    }
-
-    bool phaseAllows(Person* p, bool wantsDriver) {
-        switch (phase) {
-            case KIDKID_OUT:
-                // two kids out to mainland
-                return !p->isAdult;
-
-            case KID_BACK:
-                // one kid returns to the island
-                return !p->isAdult;
-
-            case ADULT_WITH_KID:
-                if (wantsDriver) {
-                    // kid must drive
-                    return !p->isAdult;
-                } else {
-                    // adult as passenger
-                    return p->isAdult;
-                }
-
-            case KID_BACK2:
-                // one kid returns again to reset for next cycle
-                return !p->isAdult;
-
-            case KIDS_FINISH:
-                // Final trip(s): only children, and boat must start on island.
-                if (p->isAdult) return false;
-                return (location == ISLAND);
-        }
-        return true; // defensive
-    }
-
-
-    void nextPhase_unlocked() {
-        // Complete the 4-step shuttle pattern first. Only after the kid
-        // has rowed back in KID_BACK2 and there are no adults left do we
-        // switch to the final "kids only" phase.
-        if (phase == KIDKID_OUT) {
-            phase = KID_BACK;
-        } else if (phase == KID_BACK) {
-            phase = ADULT_WITH_KID;
-        } else if (phase == ADULT_WITH_KID) {
-            phase = KID_BACK2;
-        } else if (phase == KID_BACK2) {
-            if (!adultsRemain())
-                phase = KIDS_FINISH;   // now safe to finish with kids only
-            else
-                phase = KIDKID_OUT;    // start another adult cycle
-        }
-    }
-
-    // ---- boarding ----
-    bool tryBoard(Person* p, bool wantsDriver) {
-        // must be on the same side as the boat
-        mutex.wait();
-        bool sameSide = (location == p->position);
-        mutex.signal();
-        if (!sameSide) return false;
-
-        // Pre-check under mutex (may flip to passenger if driver already present)
-        mutex.wait();
-        if (wantsDriver && driver != nullptr &&
-            passenger == nullptr && canBoardAsPassenger(p)) {
-            wantsDriver = false; // someone already driving → take passenger seat
-        }
-
-        bool preOk = (location == p->position) &&
-                     phaseAllows(p, wantsDriver) &&
-                     (wantsDriver ? (driver == nullptr) : (passenger == nullptr)) &&
-                     (wantsDriver ? (p->consectiveRows < 4) : true) &&
-                     canBoardAsPassenger(p);
-        mutex.signal();
-
-        if (!preOk) return false;
-
-        // wait for a seat
-        seatSlots.wait();
-
-        // Re-check after possibly waiting (state may have changed)
-        mutex.wait();
-        if (wantsDriver && driver != nullptr &&
-            passenger == nullptr && canBoardAsPassenger(p)) {
-            wantsDriver = false;
-        }
-
-        bool ok = (location == p->position) &&
-                  phaseAllows(p, wantsDriver) &&
-                  (wantsDriver ? (driver == nullptr) : (passenger == nullptr)) &&
-                  (wantsDriver ? (p->consectiveRows < 4) : true) &&
-                  canBoardAsPassenger(p);
-
-        if (!ok) {
-            mutex.signal();
-            seatSlots.signal();
-            return false;
-        }
-
-        if (wantsDriver) {
-            driver = p;
-            std::cout << (p->isAdult ? "Adult " : "Child ") << p->id
-                      << " got into the driver's seat of the boat." << std::endl;
-            needDriver.signal();
-        } else {
-            passenger = p;
-            std::cout << (p->isAdult ? "Adult " : "Child ") << p->id
-                      << " got into the passenger seat of the boat." << std::endl;
-        }
-
-        if (compositionValid()) {
-            // we now have a valid boat (solo or pair) → allow departure
-            readyToDepart.signal();
-        }
-
-        mutex.signal();
-        return true;
-    }
-
-    // ---- trip ----
-    void departIfDriver(Person* me) {
-        // Only the driver should proceed here
-        needDriver.wait();    // ensure someone declared as driver
-        readyToDepart.wait(); // wait until composition is valid
-
-        // Lock and pre-flip location so no one can “board mid-trip”
-        Loc start, dest;
-        mutex.wait();
-        start = location;
-        dest  = (location == ISLAND ? MAINLAND : ISLAND);
-        location = dest;      // mark boat as already at destination for boarding logic
-        mutex.signal();
-
-        std::cout << "Boat is traveling from "
-                  << (start == ISLAND ? "island"   : "mainland")
-                  << " to "
-                  << (dest  == ISLAND ? "island"   : "mainland")
-                  << std::endl;
-
-        std::this_thread::sleep_for(std::chrono::seconds(dist(rng)));
-
-        // Update shared state
-        mutex.wait();
-
-        // move each rider and update island counts
-        auto movePerson = [&](Person* x) {
-            if (!x) return;
-            if (start == ISLAND) {
-                // going island -> mainland
-                if (x->isAdult) adultsOnIsland--;
-                else            childrenOnIsland--;
-                x->position = MAINLAND;
-            } else {
-                // going mainland -> island
-                if (x->isAdult) adultsOnIsland++;
-                else            childrenOnIsland++;
-                x->position = ISLAND;
-            }
-        };
-
-        movePerson(driver);
-        movePerson(passenger);
-
-        if (start == ISLAND) tripsToMain++;
-        else                 tripsToIsland++;
-
-        // stats about boat contents
-        if (driver && passenger) {
-            if (!driver->isAdult && !passenger->isAdult) twokidBoats++;
-            else                                         kidAdultBoats++;
-        } else {
-            soloBoats++;
-        }
-        if (driver) {
-            if (driver->isAdult) adultDrivers++;
-            else                 childDrivers++;
-        }
-
-        // row quota tracking
-        if (driver)    driver->consectiveRows++;
-        if (passenger) passenger->consectiveRows = 0; // passenger is a break
-
-        // how many riders were actually on board?
-        int riders = 0;
-        if (driver)    riders++;
-        if (passenger) riders++;
-
-        // clear boat & advance phase
-        driver = passenger = nullptr;
-        nextPhase_unlocked();
-
-        mutex.signal();
-
-        // free the seats we actually used
-        for (int i = 0; i < riders; ++i) seatSlots.signal();
-        // signal end-of-trip to each rider (driver + passenger)
-        for (int i = 0; i < riders; ++i) tripDone.signal();
-    }
-
-    bool allDone() {
-        mutex.wait();
-        // done when no one is on the ISLAND anymore
-        bool done = (adultsOnIsland == 0 && childrenOnIsland == 0);
-        mutex.signal();
-        return done;
-    }
-
-    void summary() {
-        std::cout << "Summary of Events" << std::endl;
-        std::cout << "Boat traveled to the mainland: " << tripsToMain << std::endl;
-        std::cout << "Boat returned to the island: "   << tripsToIsland << std::endl;
-        std::cout << "Boats with 2 children: "         << twokidBoats << std::endl;
-        std::cout << "Boats with 1 child and 1 adult: " << kidAdultBoats << std::endl;
-        std::cout << "Boats with only 1 person (child or adult): "
-                  << soloBoats << std::endl;
-        std::cout << "Times adults where the driver: "   << adultDrivers << std::endl;
-        std::cout << "Times children where the driver: " << childDrivers << std::endl;
-    }
+    /**
+     * @brief Generates a random trip time between 1 and 4 seconds.
+     * 
+     * @param void
+     * 
+     * @return int Random trip time in seconds.
+     * 
+     * @details Uses the boat's internal uniform distribution and RNG to produce a value in the inclusive range [1,4].
+     */
+    int tripTime() { return dist(rng); }
 };
 
 static Boat* gBoat = nullptr;
 
-// -------- Person methods --------
+/**
+ * @brief The main execution loop for each Person thread.
+ * 
+ * @param void
+ * 
+ * @return void
+ * 
+ * @details person waits for their assignment as a driver or passenger,
+ * performs the boat trip, updates the boat and personal state,
+ * and handles termination conditions.
+ */
 void Person::run() {
-    if (isAdult) adultLoop();
-    else         childLoop();
-}
-
-void Person::adultLoop() {
-    // Adults: only go ISLAND -> MAINLAND, once, as passenger with child driver
+    std::unique_lock<std::mutex> lk(gBoat->mtx);
     while (true) {
-        if (gBoat->allDone()) return;
-        if (!gBoat->tryBoard(this, /*wantsDriver=*/false)) continue;
-        // adult is aboard as passenger; wait for trip to finish
-        gBoat->tripDone.wait();
-        return; // done after reaching mainland
-    }
-}
+        // exit condition: I'm on mainland and won't be needed anymore
+        if (gBoat->adultsOnIsland == 0 && gBoat->childrenOnIsland == 0 && position == MAINLAND) {
+            return;
+        }
 
-void Person::childLoop() {
-    while (true) {
-        if (gBoat->allDone()) return;
+        // Wait for assignment or final termination (when everyone is on mainland)
+        cv.wait(lk, [&]{
+            return role != NONE || (gBoat->adultsOnIsland == 0 && gBoat->childrenOnIsland == 0 && position == MAINLAND);
+        });
 
-        // children prefer to drive unless they’ve hit 4 consecutive rows
-        bool wantsDriver = (consectiveRows < 4);
+        // if assigned as driver
+        if (role == DRIVER) {
+            // print boarding
+            std::cout << (isAdult ? "Adult " : "Child ") << id
+                      << " got into the driver's seat of the boat." << std::endl;
+            seated = true;
+            gBoat->boardedCount++;
 
-        if (!gBoat->tryBoard(this, wantsDriver)) continue;
+            // wait until passenger (if any) is seated as well
+            while (gBoat->passenger != nullptr && !gBoat->passenger->seated) {
+                // release lock briefly to let passenger proceed
+                gBoat->mtx.unlock();
+                std::this_thread::yield();
+                gBoat->mtx.lock();
+            }
 
-        // after boarding, check if we actually became the driver
-        bool amDriver;
-        gBoat->mutex.wait();
-        amDriver = (gBoat->driver == this);
-        gBoat->mutex.signal();
+            // start trip: perform travel (release lock during sleep)
+            Loc start = gBoat->location;
+            Loc dest = (start == ISLAND ? MAINLAND : ISLAND);
+            gBoat->location = dest; // preflip
 
-        if (amDriver) {
-            // I’m the driver
-            gBoat->departIfDriver(this);
-            gBoat->tripDone.wait();  // wait for my own trip completion signal
-        } else {
-            // I’m passenger
-            gBoat->tripDone.wait();
-            consectiveRows = 0;      // being passenger is a break
+            std::cout << "Boat is traveling from "
+                      << (start==ISLAND?"island":"mainland")
+                      << " to " << (dest==ISLAND?"island":"mainland") << std::endl;
+
+            int t = gBoat->tripTime();
+            gBoat->mtx.unlock();
+            std::this_thread::sleep_for(std::chrono::seconds(t));
+            gBoat->mtx.lock();
+
+            // move riders and update counts
+            auto movePerson = [&](Person* p) {
+                if (!p) return;
+                if (start == ISLAND) {
+                    if (p->isAdult) gBoat->adultsOnIsland--;
+                    else gBoat->childrenOnIsland--;
+                    p->position = MAINLAND;
+                } else {
+                    if (p->isAdult) gBoat->adultsOnIsland++;
+                    else gBoat->childrenOnIsland++;
+                    p->position = ISLAND;
+                }
+            };
+
+            movePerson(this);
+            movePerson(gBoat->passenger);
+
+            if (start == ISLAND) gBoat->tripsToMain++; else gBoat->tripsToIsland++;
+
+            // stats
+            if (gBoat->driver && gBoat->passenger) {
+                if (!gBoat->driver->isAdult && !gBoat->passenger->isAdult) gBoat->twokidBoats++;
+                else gBoat->kidAdultBoats++;
+            } else {
+                gBoat->soloBoats++;
+            }
+            if (gBoat->driver) {
+                if (gBoat->driver->isAdult) gBoat->adultDrivers++; else gBoat->childDrivers++;
+            }
+
+            // consecutive row handling
+            if (gBoat->driver) {
+                gBoat->driver->consecutiveRows++;
+                if (gBoat->driver->consecutiveRows >= MAX_CONSECUTIVE) gBoat->driver->needsBreak = true;
+            }
+            if (gBoat->passenger) {
+                gBoat->passenger->consecutiveRows = 0;
+                gBoat->passenger->needsBreak = false;
+            }
+
+            // clear boat pointers and boarded flags
+            gBoat->driver = nullptr;
+            gBoat->passenger = nullptr;
+            gBoat->boardedCount = 0;
+
+            // // debug status
+            // std::cout << "[Status] location=" << (gBoat->location==ISLAND?"island":"mainland")
+            //           << ", adultsOnIsland=" << gBoat->adultsOnIsland
+            //           << ", childrenOnIsland=" << gBoat->childrenOnIsland << std::endl;
+
+            // wake controller and any passenger waiting (trip done)
+            gBoat->tripDoneCv.notify_all();
+
+            // reset my role/seated
+            role = NONE;
+            seated = false;
+
+            // if I'm on mainland now and nobody needs me, I may exit in next loop
+            continue;
+        }
+
+        // if assigned passenger
+        if (role == PASSENGER) {
+            std::cout << (isAdult ? "Adult " : "Child ") << id
+                      << " got into the passenger seat of the boat." << std::endl;
+            seated = true;
+            gBoat->boardedCount++;
+
+            // wait for trip completion
+            gBoat->tripDoneCv.wait(lk);
+
+            // after trip, reset role/seated
+            role = NONE;
+            seated = false;
+            continue;
         }
     }
 }
 
-// -------- main --------
-int main(int argc, char** argv) {
+/**
+ * @brief Parse program arguments for number of adults and children.
+ *
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ * @param A Output adults count (filled on success).
+ * @param C Output children count (filled on success).
+ * 
+ * @return true if parsing succeeded, false otherwise.
+ * 
+ * @details Validates that exactly two numeric arguments are provided and
+ *          that both numbers are greater than zero. On success `A` and `C`
+ *          are set to the parsed values.
+ */
+bool parse_args(int argc, char** argv, int &A, int &C) {
     if (argc != 3) {
-        std::cerr << "usage: ./bin/island <adults> <children>" << std::endl;
-        return 1;
+        std::cerr << "usage: ./bin/island_2 <adults> <children>" << std::endl;
+        return false;
     }
-    int A = std::stoi(argv[1]);
-    int C = std::stoi(argv[2]);
+    A = std::stoi(argv[1]);
+    C = std::stoi(argv[2]);
     if (A <= 0 || C <= 0) {
         std::cerr << "inputs must be > 0" << std::endl;
-        return 1;
+        return false;
     }
+    return true;
+}
 
-    Boat boat(A, C);
-    gBoat = &boat;
-
+/**
+ * @brief Initialize person objects and assign them to the boat.
+ *
+ * @param boat Pointer to the shared Boat instance.
+ * @param A Number of adults.
+ * @param C Number of children.
+ * 
+ * @return std::vector<std::unique_ptr<Person>> Container of created people.
+ * 
+ * @details Allocates `A` adult and `C` child `Person` instances, sets their
+ *          initial positions to `ISLAND`, assigns the shared `boat` pointer,
+ *          and returns the owning vector of unique pointers.
+ */
+std::vector<std::unique_ptr<Person>> init_people(Boat* boat, int A, int C) {
     std::vector<std::unique_ptr<Person>> people;
     people.reserve(A + C);
-
-    // Adults: IDs 1..A
     for (int i = 0; i < A; ++i) {
         auto p = std::make_unique<Person>();
-        p->id = i + 1;            // Adult IDs 1..A
+        p->id = i+1;
         p->isAdult = true;
-        p->boat = gBoat;
         p->position = ISLAND;
+        p->boat = boat;
         people.push_back(std::move(p));
     }
-    // Children: IDs 1..C
     for (int i = 0; i < C; ++i) {
         auto p = std::make_unique<Person>();
-        p->id = i + 1;            // Child IDs 1..C
+        p->id = i+1;
         p->isAdult = false;
-        p->boat = gBoat;
         p->position = ISLAND;
+        p->boat = boat;
         people.push_back(std::move(p));
     }
+    return people;
+}
 
-    // start all threads
-    for (auto& p : people) {
-        p->th = std::thread(&Person::run, p.get());
+/**
+ * @brief Find a person matching criteria.
+ *
+ * @param people Container of person pointers.
+ * @param wantAdult true for adult, false for child.
+ * @param where Location to search (ISLAND/MAINLAND).
+ * @param excludeNeedsBreak whether to exclude those needing a break.
+ * 
+ * @return Person* or nullptr if none found.
+ * 
+ * @details Scans `people` for a person matching the requested age and
+ *          location, who is not already assigned (`role == NONE`). The
+ *          first pass prefers persons below the consecutive-row limit; the
+ *          second pass relaxes that preference but still honors
+ *          `excludeNeedsBreak` if requested.
+ */
+Person* find_person(std::vector<std::unique_ptr<Person>> &people, bool wantAdult, Loc where, bool excludeNeedsBreak = true) {
+    for (auto &p : people) {
+        if (p->isAdult != wantAdult) continue;
+        if (p->position != where) continue;
+        if (p->role != Person::NONE) continue;
+        if (excludeNeedsBreak && p->needsBreak) continue;
+        if (p->consecutiveRows >= MAX_CONSECUTIVE) continue;
+        return p.get();
     }
-    // join all threads
-    for (auto& p : people) {
-        p->th.join();
+    for (auto &p : people) {
+        if (p->isAdult != wantAdult) continue;
+        if (p->position != where) continue;
+        if (p->role != Person::NONE) continue;
+        if (excludeNeedsBreak && p->needsBreak) continue;
+        return p.get();
+    }
+    return nullptr;
+}
+
+/**
+ * @brief Controller loop that orchestrates deterministic ferrying of people.
+ *
+ * @param boat Reference to shared Boat.
+ * @param people Container of people.
+ * 
+ * @return void
+ * 
+ * @details Implements the deterministic two-child ferry algorithm used by
+ *          the original solution: it repeatedly moves two children,
+ *          returns one, ships an adult with a child driving, and returns a
+ *          child, until all adults are moved; then it moves remaining
+ *          children. The function holds the boat mutex while deciding and
+ *          notifying riders, and releases it while waiting for trip
+ *          completion.
+ */
+void controller_loop(Boat &boat, std::vector<std::unique_ptr<Person>> &people) {
+    std::unique_lock<std::mutex> lk(boat.mtx);
+
+    while (boat.adultsOnIsland > 0) {
+        // 1) Two children go island -> mainland
+        Person* c1 = find_person(people, false, ISLAND, /*excludeNeedsBreak=*/false);
+        Person* c2 = nullptr;
+        if (c1) {
+            for (auto &p : people) if (!p->isAdult && p->position==ISLAND && p->role==Person::NONE && p.get()!=c1) { c2 = p.get(); break; }
+        }
+        if (!c1 || !c2) break;
+        boat.driver = c1; boat.passenger = c2;
+        c1->role = Person::DRIVER; c2->role = Person::PASSENGER; c1->seated = c2->seated = false;
+        c1->cv.notify_one(); c2->cv.notify_one();
+        boat.tripDoneCv.wait(lk);
+
+        // 2) One child returns mainland -> island
+        Person* rc = find_person(people, false, MAINLAND, /*excludeNeedsBreak=*/false);
+        if (!rc) rc = find_person(people, true, MAINLAND, /*excludeNeedsBreak=*/false);
+        if (!rc) break;
+        boat.driver = rc; boat.passenger = nullptr; rc->role = Person::DRIVER; rc->seated = false; rc->cv.notify_one();
+        boat.tripDoneCv.wait(lk);
+
+        // 3) One adult + one child go island -> mainland (child drives)
+        Person* adult = find_person(people, true, ISLAND, /*excludeNeedsBreak=*/false);
+        Person* child = find_person(people, false, ISLAND, /*excludeNeedsBreak=*/false);
+        if (!adult || !child) break;
+        boat.driver = child; boat.passenger = adult; child->role = Person::DRIVER; adult->role = Person::PASSENGER;
+        child->seated = adult->seated = false; child->cv.notify_one(); adult->cv.notify_one();
+        boat.tripDoneCv.wait(lk);
+
+        // 4) One child returns mainland -> island
+        Person* rc2 = find_person(people, false, MAINLAND, /*excludeNeedsBreak=*/false);
+        if (!rc2) rc2 = find_person(people, true, MAINLAND, /*excludeNeedsBreak=*/false);
+        if (!rc2) break;
+        boat.driver = rc2; boat.passenger = nullptr; rc2->role = Person::DRIVER; rc2->seated = false; rc2->cv.notify_one();
+        boat.tripDoneCv.wait(lk);
     }
 
-    boat.summary();
+    // Move remaining children in pairs (or solo)
+    while (boat.childrenOnIsland > 0) {
+        if (boat.childrenOnIsland >= 2) {
+            Person* c1 = find_person(people, false, ISLAND);
+            Person* c2 = nullptr;
+            if (c1) for (auto &p : people) if (!p->isAdult && p->position==ISLAND && p->role==Person::NONE && p.get()!=c1) { c2 = p.get(); break; }
+            if (c1 && c2) {
+                boat.driver = c1; boat.passenger = c2;
+                c1->role = Person::DRIVER; c2->role = Person::PASSENGER;
+                c1->seated = c2->seated = false;
+                c1->cv.notify_one(); c2->cv.notify_one();
+                boat.tripDoneCv.wait(lk);
+            } else break;
+        } else {
+            Person* c = find_person(people, false, ISLAND);
+            if (c) {
+                boat.driver = c; c->role = Person::DRIVER; c->seated=false; c->cv.notify_one();
+                boat.tripDoneCv.wait(lk);
+            } else break;
+        }
+    }
+
+    // wake anyone still blocked to let threads exit
+    for (auto &p : people) p->cv.notify_one();
+
+    // unlock while joining threads
+    lk.unlock();
+}
+
+/**
+ * @brief Start threads for all people in container.
+ *
+ * @param people Container of people whose threads will be started.
+ * 
+ * @return void
+ * 
+ * @details Creates a `std::thread` for each `Person` that runs
+ *          `Person::run()` and stores it in the person's `th` member.
+ */
+void start_threads(std::vector<std::unique_ptr<Person>> &people) {
+    for (auto &p : people) p->th = std::thread(&Person::run, p.get());
+}
+
+/**
+ * @brief Join all threads in people container.
+ *
+ * @param people Container of people whose threads will be joined.
+ * 
+ * @return void
+ * 
+ * @details Joins each person's thread if it is joinable to ensure clean
+ *          termination before the program exits.
+ */
+void join_threads(std::vector<std::unique_ptr<Person>> &people) {
+    for (auto &p : people) if (p->th.joinable()) p->th.join();
+}
+
+/**
+ * @brief Print a concise summary of the boat statistics.
+ *
+ * @param boat Reference to the Boat whose stats will be printed.
+ * 
+ * @return void
+ * 
+ * @details Prints trip counts and driver statistics collected during the
+ *          simulation to standard output.
+ */
+void print_summary(Boat &boat) {
+    std::cout << "Summary of Events" << std::endl;
+    std::cout << "Boat traveled to the mainland: " << boat.tripsToMain << std::endl;
+    std::cout << "Boat returned to the island: " << boat.tripsToIsland << std::endl;
+    std::cout << "Boats with 2 children: " << boat.twokidBoats << std::endl;
+    std::cout << "Boats with 1 child and 1 adult: " << boat.kidAdultBoats << std::endl;
+    std::cout << "Boats with only 1 person (child or adult): " << boat.soloBoats << std::endl;
+    std::cout << "Times adults where the driver: " << boat.adultDrivers << std::endl;
+    std::cout << "Times children where the driver: " << boat.childDrivers << std::endl;
+}
+
+/**
+ * @brief Main function to initialize the boat and persons, start threads, and manage the simulation.
+ * 
+ * @param argc Argument count.
+ * @param argv Argument vector containing number of adults and children.
+ * 
+ * @return int
+ * 
+ * @details Parses arguments, initializes state, starts person threads,
+ *          runs the deterministic controller loop, joins threads, and
+ *          prints a summary of the simulation.
+ */
+int main(int argc, char** argv) {
+
+    int A = 0, C = 0;
+    if (!parse_args(argc, argv, A, C)) return 1;
+
+    Boat boat;
+    boat.adultsOnIsland = A;
+    boat.childrenOnIsland = C;
+    gBoat = &boat;
+
+    auto people = init_people(gBoat, A, C);
+    start_threads(people);
+    controller_loop(boat, people);
+    join_threads(people);
+    print_summary(boat);
+
     return 0;
 }
